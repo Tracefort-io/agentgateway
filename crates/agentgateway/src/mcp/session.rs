@@ -15,9 +15,9 @@ use futures_util::StreamExt;
 use headers::HeaderMapExt;
 use http_body_util::BodyExt as _;
 use rmcp::model::{
-	ClientConfig, ClientJsonRpcMessage, ClientNotification, ClientRequest, ConstString, GetMeta,
-	Implementation, InitializeRequest, JsonRpcRequest, ProtocolVersion, Reference, RequestId,
-	RequestMetaObject, ServerJsonRpcMessage,
+	ClientConfig, ClientJsonRpcMessage, ClientRequest, ConstString, GetMeta, Implementation,
+	InitializeRequest, JsonRpcRequest, ProtocolVersion, Reference, RequestId, RequestMetaObject,
+	ServerJsonRpcMessage,
 };
 use rmcp::transport::common::http_header::{EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE};
 use sse_stream::{KeepAlive, Sse, SseBody, SseStream};
@@ -428,6 +428,9 @@ impl Session {
 				}
 				.into(),
 			),
+			Err(UpstreamError::McpGuardrailsNotification(rej)) => {
+				Err(mcp::Error::McpGuardrailsNotification(rej).into())
+			},
 			Err(UpstreamError::InvalidRequest(message)) if req_id.is_some() && downstream_modern => {
 				Err(mcp::Error::InvalidParams(req_id, message).into())
 			},
@@ -798,14 +801,7 @@ impl Session {
 				}
 			},
 			ClientJsonRpcMessage::Notification(r) => {
-				let method = match &r.notification {
-					ClientNotification::CancelledNotification(r) => r.method.as_str(),
-					ClientNotification::ProgressNotification(r) => r.method.as_str(),
-					ClientNotification::InitializedNotification(r) => r.method.as_str(),
-					ClientNotification::RootsListChangedNotification(r) => r.method.as_str(),
-					ClientNotification::CustomNotification(r) => r.method.as_str(),
-					_ => "unknown",
-				};
+				let method = mcp::upstream::client_notification_method(&r.notification);
 				let (log, _cel) = mcp::handler::setup_request_log(&ctx);
 				let session_id = (!self.synthetic).then(|| self.id.to_string());
 				log.non_atomic_mutate(|l| {

@@ -597,6 +597,9 @@ impl ProxyError {
 			// Note: we do not return a 401/403 here, as the obscure that it was rejected due to auth
 			ProxyError::MCP(mcp::Error::Authorization(_, _, _)) => StatusCode::BAD_REQUEST,
 			ProxyError::MCP(mcp::Error::McpGuardrails { .. }) => StatusCode::OK,
+			// A rejected notification cannot be answered in JSON-RPC; MCP Streamable
+			// HTTP asks for an HTTP error status (for example 400) instead of 202.
+			ProxyError::MCP(mcp::Error::McpGuardrailsNotification(_)) => StatusCode::BAD_REQUEST,
 			ProxyError::MCP(mcp::Error::RateLimited { .. }) => StatusCode::OK,
 		}
 	}

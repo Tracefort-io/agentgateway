@@ -28,7 +28,7 @@ use crate::mcp::rbac::{CelExecWrapper, McpAuthorizationSet};
 use crate::mcp::router::McpBackendGroup;
 use crate::mcp::streamablehttp::{RequestProtocol, ServerSseMessage};
 use crate::mcp::subscriptions::ResourceSubscription;
-use crate::mcp::upstream::{IncomingRequestContext, UpstreamError};
+use crate::mcp::upstream::{IncomingRequestContext, UpstreamError, client_notification_method};
 use crate::mcp::{ClientError, FailureMode, MCPInfo, apps, mergestream, rbac, upstream};
 use crate::proxy::httpproxy::PolicyClient;
 use crate::telemetry::log::AsyncLog;
@@ -1717,8 +1717,14 @@ impl Relay {
 	pub async fn send_notification(
 		&self,
 		r: JsonRpcNotification<ClientNotification>,
-		ctx: IncomingRequestContext,
+		mut ctx: IncomingRequestContext,
 	) -> Result<Response, UpstreamError> {
+		// Client notifications go through the request-phase mcpGuardrails hook,
+		// as requests do, before any upstream is contacted: a rejection forwards
+		// nothing, and the hook's header mutations apply to every upstream copy.
+		self
+			.run_notification_guardrails(&r.notification, &mut ctx)
+			.await?;
 		let futs: Vec<_> = self
 			.upstreams
 			.iter_named()
@@ -1755,6 +1761,51 @@ impl Relay {
 		}
 
 		Ok(accepted_response())
+	}
+
+	/// Runs the request-phase mcpGuardrails hook for a client notification, once,
+	/// with every upstream it fans out to. Like fanout requests, a notification has
+	/// no params to rewrite, so only a rejection and header mutations take effect.
+	async fn run_notification_guardrails(
+		&self,
+		notification: &ClientNotification,
+		ctx: &mut IncomingRequestContext,
+	) -> Result<(), UpstreamError> {
+		let Some(ext) = self.mcp_guardrails.as_ref() else {
+			return Ok(());
+		};
+		let method = client_notification_method(notification);
+		if !ext.runs_request(method) {
+			return Ok(());
+		}
+		let service_names = self
+			.upstreams
+			.iter_named()
+			.map(|(n, _)| n.to_string())
+			.collect::<Vec<_>>();
+		let outcome = Box::pin(
+			crate::mcp::guardrails::run_call_request::<serde_json::Value>(
+				ext,
+				&mut crate::mcp::guardrails::CallRequestCtx {
+					backends: &service_names,
+					method,
+					body: mcp::guardrails::MCPBody::new(None),
+				},
+				ctx,
+				&self.policy_client,
+			),
+		)
+		.await;
+		if let crate::mcp::guardrails::Outcome::Reject(rej) = outcome {
+			tracing::debug!(
+				method,
+				code = rej.code.0,
+				message = %rej.message,
+				"mcpGuardrails: notification rejected",
+			);
+			return Err(UpstreamError::McpGuardrailsNotification(rej));
+		}
+		Ok(())
 	}
 
 	pub async fn send_notification_single(
