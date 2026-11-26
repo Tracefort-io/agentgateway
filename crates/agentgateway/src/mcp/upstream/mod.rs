@@ -173,6 +173,18 @@ impl IncomingRequestContext {
 	}
 }
 
+/// The JSON-RPC method of a client notification.
+pub(crate) fn client_notification_method(notification: &ClientNotification) -> &str {
+	match notification {
+		ClientNotification::CancelledNotification(r) => r.method.as_str(),
+		ClientNotification::ProgressNotification(r) => r.method.as_str(),
+		ClientNotification::InitializedNotification(r) => r.method.as_str(),
+		ClientNotification::RootsListChangedNotification(r) => r.method.as_str(),
+		ClientNotification::CustomNotification(r) => r.method.as_str(),
+		_ => "unknown",
+	}
+}
+
 #[derive(Debug, Error)]
 pub enum UpstreamError {
 	#[error("unknown {resource_type}: {resource_name}")]
@@ -186,6 +198,10 @@ pub enum UpstreamError {
 		was_tool_call: bool,
 		downstream_modern: bool,
 	},
+	/// A client notification the request-phase mcpGuardrails hook rejected. A
+	/// notification has no id, so the rejection cannot be a JSON-RPC response.
+	#[error("mcpGuardrails rejected notification: {}", .0.message)]
+	McpGuardrailsNotification(rmcp::ErrorData),
 	#[error("invalid request: {0}")]
 	InvalidRequest(String),
 	/// A server-side availability/capability gap. Distinct from `InvalidRequest`,
@@ -441,14 +457,7 @@ impl Upstream {
 		if matches!(self, Upstream::OpenAPI(_)) {
 			return Ok(());
 		}
-		let method = match &request {
-			ClientNotification::CancelledNotification(r) => r.method.as_str(),
-			ClientNotification::ProgressNotification(r) => r.method.as_str(),
-			ClientNotification::InitializedNotification(r) => r.method.as_str(),
-			ClientNotification::RootsListChangedNotification(r) => r.method.as_str(),
-			ClientNotification::CustomNotification(r) => r.method.as_str(),
-			_ => "unknown",
-		};
+		let method = client_notification_method(&request);
 		let mut ctx = ctx.clone().with_mcp_target(target_name);
 		let mut span = ctx.start_mcp_outbound_span(
 			format!("{method} {target_name}"),

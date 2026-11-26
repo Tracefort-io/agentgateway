@@ -9958,6 +9958,156 @@ async fn mcp_guardrails_header_mutation_reaches_upstream() {
 	);
 }
 
+// Guardrails for every method, as a gateway that sends each message to its
+// policy server configures them.
+fn every_method_in_request_phase() -> std::collections::HashMap<String, guardrails::Phase> {
+	std::collections::HashMap::from([("*".to_string(), guardrails::Phase::Request)])
+}
+
+// Initializes a session through the proxy with raw JSON-RPC, sending the
+// secret header, and returns the session id.
+async fn raw_initialize(client: &reqwest::Client, url: &str) -> String {
+	let resp = mcp_json_post(client, url, &mcp_initialize_body())
+		.header("x-agent-secret", "s3cret")
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), reqwest::StatusCode::OK, "initialize");
+	resp
+		.headers()
+		.get("mcp-session-id")
+		.expect("stateful session id")
+		.to_str()
+		.unwrap()
+		.to_string()
+}
+
+#[tokio::test]
+async fn mcp_guardrails_notification_runs_request_hook() {
+	use crate::test_helpers::extmcpmock::{closure_mock, pass_request_with, pass_response};
+
+	// The policy server marks each request with its method and removes the
+	// secret header, as one that strips a credential meant only for itself.
+	let extmcp_mock = closure_mock(
+		|req| {
+			pass_request_with(
+				vec![("x-guardrail-method", req.method.clone())],
+				vec!["x-agent-secret"],
+				None,
+			)
+		},
+		|_| pass_response(),
+	)
+	.spawn()
+	.await;
+
+	let (mock, captured) = mock_streamable_http_server_with_capture(true).await;
+	let (_bind, io) = setup_proxy_policies(
+		&mock,
+		true,
+		false,
+		vec![guardrails_test_support::policy_with(
+			extmcp_mock.address,
+			guardrails::FailureMode::FailClosed,
+			every_method_in_request_phase(),
+			std::collections::HashMap::new(),
+		)],
+	)
+	.await;
+	let client = reqwest::Client::new();
+	let url = format!("http://{io}/mcp");
+	let session = raw_initialize(&client, &url).await;
+
+	let resp = mcp_json_post(
+		&client,
+		&url,
+		&serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+	)
+	.header("mcp-session-id", &session)
+	.header("x-agent-secret", "s3cret")
+	.send()
+	.await
+	.unwrap();
+	assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
+
+	let headers = captured.lock().unwrap().clone();
+	let notification = headers
+		.iter()
+		.find(|h| {
+			h.get("x-guardrail-method").map(|v| v.as_bytes()) == Some(b"notifications/initialized")
+		})
+		.unwrap_or_else(|| panic!("the notification went through the request hook; saw {headers:?}"));
+	assert!(
+		!notification.contains_key("x-agent-secret"),
+		"the hook's header removal applies to the notification sent upstream",
+	);
+}
+
+#[tokio::test]
+async fn mcp_guardrails_rejected_notification_is_not_forwarded() {
+	use protos::ext_mcp::authorization_error::Code;
+
+	use crate::test_helpers::extmcpmock::{
+		closure_mock, pass_request, pass_response, reject_request,
+	};
+
+	let extmcp_mock = closure_mock(
+		|req| {
+			if req.method == "notifications/initialized" {
+				reject_request(Code::PermissionDenied, "notification denied by mock")
+			} else {
+				pass_request()
+			}
+		},
+		|_| pass_response(),
+	)
+	.spawn()
+	.await;
+
+	let (mock, captured) = mock_streamable_http_server_with_capture(true).await;
+	let (_bind, io) = setup_proxy_policies(
+		&mock,
+		true,
+		false,
+		vec![guardrails_test_support::policy_with(
+			extmcp_mock.address,
+			guardrails::FailureMode::FailClosed,
+			every_method_in_request_phase(),
+			std::collections::HashMap::new(),
+		)],
+	)
+	.await;
+	let client = reqwest::Client::new();
+	let url = format!("http://{io}/mcp");
+	let session = raw_initialize(&client, &url).await;
+	let upstream_before = captured.lock().unwrap().len();
+
+	let resp = mcp_json_post(
+		&client,
+		&url,
+		&serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+	)
+	.header("mcp-session-id", &session)
+	.send()
+	.await
+	.unwrap();
+	assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+	let body: serde_json::Value = resp.json().await.unwrap();
+	assert_eq!(
+		body["error"]["message"], "notification denied by mock",
+		"{body}"
+	);
+	assert!(
+		body.get("id").is_none_or(|id| id.is_null()),
+		"a notification has no id to answer: {body}"
+	);
+	assert_eq!(
+		captured.lock().unwrap().len(),
+		upstream_before,
+		"a rejected notification reaches no upstream"
+	);
+}
+
 #[tokio::test]
 async fn mcp_guardrails_request_headers_visible_to_policy_server() {
 	use std::sync::Mutex as StdMutex;

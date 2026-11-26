@@ -198,6 +198,11 @@ pub enum Error {
 		was_tool_call: bool,
 		downstream_modern: bool,
 	},
+	/// A client notification the request-phase mcpGuardrails hook rejected. It is
+	/// not forwarded; the client gets an HTTP error status, since a notification
+	/// cannot be answered with a JSON-RPC response (MCP Streamable HTTP).
+	#[error("mcpGuardrails rejected notification: {}", .0.message)]
+	McpGuardrailsNotification(rmcp::ErrorData),
 	#[error("{}", .message.as_deref().unwrap_or("rate limit exceeded"))]
 	RateLimited {
 		request_id: RequestId,
@@ -268,7 +273,9 @@ impl Error {
 			| Error::InvalidParams(_, _) => return self.to_string().into(),
 			Error::PayloadTooLarge(_) => "request body too large",
 			Error::Unavailable(_, _) => "service unavailable",
-			Error::McpGuardrails { .. } => "request rejected by guardrail",
+			Error::McpGuardrails { .. } | Error::McpGuardrailsNotification(_) => {
+				"request rejected by guardrail"
+			},
 			Error::RateLimited { .. } => "rate limit exceeded",
 			Error::StartSession(_) => "failed to create session",
 			Error::Stdio(_) => "failed to start stdio server",
@@ -310,6 +317,15 @@ impl Error {
 				downstream_modern,
 			} if rej.code != ErrorCode::INTERNAL_ERROR => {
 				return tool_error_body(request_id, rej.message.to_string(), *downstream_modern);
+			},
+			// A notification has no id: the policy's error goes back without one.
+			Error::McpGuardrailsNotification(rej) => {
+				return serde_json::to_string(&JsonRpcError {
+					jsonrpc: Default::default(),
+					id: None,
+					error: rej.clone(),
+				})
+				.ok();
 			},
 			_ => {},
 		}
